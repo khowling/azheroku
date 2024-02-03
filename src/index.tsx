@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import Page from "./components/page";
 import TxtResponse from "./components/response";  
 import Command from "./components/command";
+import { as } from "elysia/dist/index-3yRrZCrW";
 
 
 const azheroku_domain = process.env.AZHEROKU_DOMAIN as string
@@ -32,14 +33,42 @@ type SFDC_Auth = {
     issued_at: string
 }
 
+const SFDCType2SQL = {
+  "address": "TEXT",
+  "boolean": "BOOLEAN",
+  "currency": "DECIMAL(10,5)",
+  "date": "DATE",
+  "datetime": "DATETIME",
+  "double": "DOUBLE",
+  "id": "TEXT PRIMARY KEY",
+  "int": "INTEGER",
+  "phone": "TEXT",
+  "picklist": "TEXT",
+  "reference": "TEXT",
+  "string": "TEXT",
+  "textarea": "TEXT",
+  "url": "TEXT"
+}
+
+enum SYNC_STATUS {
+  NONE = 0,
+  PULL = 1,
+  PUSH = 2,
+  SYNC = 3
+}
+
 const db = new Database(":memory:") 
 //const db = new Database("mydb.sqlite");
-const sobjectSync = db.query(`create table syncd_objects (sobject_name string PRIMARY KEY, sfdc_definition TEXT NOT NULL, sql_definition TEXT);`);
-sobjectSync.run();
+db.query(`CREATE TABLE connections (name TEXT PRIMARY KEY, auth TEXT NOT NULL, status INTEGER);`).run();
+const upsertConnection = db.query<void, {$name: string, $auth: string, $status: number}>(`INSERT INTO connections VALUES  ($name, json($auth), $status) ON CONFLICT(name) DO UPDATE SET auth=json($auth), status=$status`);
+const getConnection = db.query<{auth: string, status: number}, {$name: string}>(`select name,auth,status FROM connections WHERE name = $name`);
 
-const upsertSync = db.query<void, {$sobject_name: string, $sfdc_definition: string, $sql_definition: string}>(`INSERT INTO syncd_objects VALUES  ($sobject_name, json($sfdc_definition), json($sql_definition)) ON CONFLICT(sobject_name) DO UPDATE SET sfdc_definition=json($sfdc_definition)`);
-const querySync = db.query<{sfdc_definition: string, sql_definition: string}, {$sobjectName: string}>(`select sfdc_definition, sql_definition FROM syncd_objects WHERE sobject_name = $sobjectName`);
-const queryAllSync = db.query<{sobject_name: string, sfdc_definition: string, sql_definition: string}, null>(`select sobject_name, sfdc_definition, sql_definition FROM syncd_objects`);
+
+db.query(`CREATE TABLE syncd_objects (sobject_name TEXT PRIMARY KEY, sfdc_definition TEXT NOT NULL, sql_definition TEXT, status INTEGER, last_sync DATE);`).run();
+
+const upsertSync = db.query<void, {$sobject_name: string, $sfdc_definition: string, $sql_definition: string, $status: number}>(`INSERT INTO syncd_objects (sobject_name, sfdc_definition, sql_definition, status) VALUES  ($sobject_name, json($sfdc_definition), $sql_definition, $status) ON CONFLICT(sobject_name) DO UPDATE SET sfdc_definition=json($sfdc_definition), status=$status`);
+const querySync = db.query<{sfdc_definition: string, sql_definition: string, status: number}, {$sobjectName: string}>(`select sfdc_definition, sql_definition, status FROM syncd_objects WHERE sobject_name = $sobjectName`);
+const queryAllSync = db.query<{sobject_name: string, sfdc_definition: string, sql_definition: string, status: number}, null>(`select sobject_name, sfdc_definition, sql_definition, status FROM syncd_objects`);
 
 
 type SFDC_SOBJECT_DEFINITION = {
@@ -78,9 +107,27 @@ const app = new Elysia()
     })
   })
   .get('/help', () =>
-      <TxtResponse assistantMessage={<div>Type <Command command='/sObjects'/> to list sObjects or... just chat to me, I can be very helpful</div>} />
+      <TxtResponse assistantMessage={<div>Type <Command command='/sObjects'/> <Command command='/status'/> to list sObjects or... just chat to me, I can be very helpful</div>} />
     )
-    // https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_describeGlobal.htm
+  .get('/status', () => {
+    const syncs = queryAllSync.all(null)
+    return <TxtResponse assistantMessage={<div>
+      <h1>Sync Status</h1>
+      <table class="table table-xs">
+        <tr>
+          <th>sObject</th>
+          <th>status</th>
+        </tr>
+        { syncs.map((sync) =>
+          <tr>
+            <td>{sync.sobject_name}</td>
+            <td>{SYNC_STATUS[sync.status]}</td>
+          </tr>
+        )}
+      </table>
+    </div>} />
+  })
+  // https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_describeGlobal.htm
   .get("/sObjects", async ({store: {sfdc_auth}}) => {
 
     if (!sfdc_auth.access_token) return  <TxtResponse assistantMessage={<LoginButton/>} />
@@ -146,7 +193,8 @@ const app = new Elysia()
 
       if (mode === 'describe') return (
         <table class="table table-xs">
-          <th>
+          <thead>
+          <tr>
             <th>name</th>
             <th>label</th>
             <th>length</th>
@@ -155,7 +203,9 @@ const app = new Elysia()
             <th>type</th>
             <th>unique</th>
             <th>length</th>
-          </th>
+          </tr>
+          </thead>
+          <tbody>
           { sobjdef.fields.map((sObject: any) =>
             <tr>
               <td>{sObject.name}</td>
@@ -168,21 +218,19 @@ const app = new Elysia()
               <td>{sObject.length}</td>
             </tr>
           )}
+          </tbody>
         </table>
       )
 
-      upsertSync.run({$sobject_name: sobjdef.name, $sfdc_definition: JSON.stringify(sobjdef), $sql_definition: '{}'})
+      db.query(`CREATE TABLE ${sObject} (${sobjdef.fields.map(f => `${f.name} ${SFDCType2SQL[f.type as keyof typeof SFDCType2SQL]}`).join(',')})`).run()
+      
+      const upsertStmt = `INSERT INTO sObject (${sobjdef.fields.map(f => f.name).join(',')}) VALUES  (${sobjdef.fields.map(f => `$${f.name}`).join(',')}) ON CONFLICT(Id) DO UPDATE SET (${sobjdef.fields.map(f => `${f.name}=$${f.name}`).join(',')}`
+      upsertSync.run({$sobject_name: sobjdef.name, $sfdc_definition: JSON.stringify(sobjdef), $sql_definition: upsertStmt, $status: SYNC_STATUS.PULL})
 
-      const processid = '' + new Date().getTime()
-      const scrollWorkaround = { 'hx-on:htmx:sse-message' : `document.getElementById('messages').scrollIntoView(false)`}
-      return <TxtResponse assistantMessage={
-          <div id={`sse-response${processid}`} hx-ext="sse" sse-connect={`/sObjects/${sObject}/${mode}/${processid}`} sse-swap={processid} hx-swap="innerHTML" hx-target={`find #stream${processid}`} {...scrollWorkaround}>
-              <div sse-swap={`close${processid}`} hx-swap="outerHTML"  hx-target={`closest #sse-response${processid}`}></div>
-              <div style="width: fit-content;" id={`stream${processid}`}></div>
-          </div>
-      } /> 
+      return <TxtResponse assistantMessage={<div>Successfully set sObject {sObject} to sync</div>} />
+      
     } catch (error) {
-      return <TxtResponse assistantMessage={<div>Failed to describe {sObject} {JSON.stringify(error)}</div>} />
+      return <TxtResponse assistantMessage={<div>Failed to process {sObject}: {JSON.stringify(error)}</div>} />
     }
 
   }, {
@@ -191,7 +239,17 @@ const app = new Elysia()
       mode: t.String((s: string) => ['describe', 'sync', 'query'].includes(s))
     })
   })
-  .get('/sObjects/:sObject/sync/:processid', async ({params: { sObject, processid },  store: {sfdc_auth}}) => new Stream(async (stream) => {
+  .get('/monitor', async () => {
+    const processid = '' + new Date().getTime()
+      const scrollWorkaround = { 'hx-on:htmx:sse-message' : `document.getElementById('messages').scrollIntoView(false)`}
+      return <TxtResponse assistantMessage={
+          <div id={`sse-response${processid}`} hx-ext="sse" sse-connect={`/monitor/${processid}`} sse-swap={processid} hx-swap="innerHTML" hx-target={`find #stream${processid}`} {...scrollWorkaround}>
+              <div sse-swap={`close${processid}`} hx-swap="outerHTML"  hx-target={`closest #sse-response${processid}`}></div>
+              <div style="width: fit-content;" id={`stream${processid}`}></div>
+          </div>
+      } /> 
+   })
+  .get('/monitor/:processid', async ({params: { sObject, processid },  store: {sfdc_auth}}) => new Stream(async (stream) => {
 
     const sync = querySync.all({$sobjectName: sObject})[0]
     const sfdc_definition = JSON.parse(sync.sfdc_definition)
@@ -200,8 +258,6 @@ const app = new Elysia()
 
     stream.send('Syncing ' + sObject + '...')
 
-    //const createtbstr = `CREATE TABLE ${sObject} (Id TEXT PRIMARY KEY` + sfdc_definition.fields.map((f: any) => `${f.name} ${f.type}`).join(',') + ')'
-    //create table syncd_objects (sobject_name string PRIMARY KEY, sfdc_definition TEXT NOT NULL, sql_definition TEXT);`);
 
     // updated and retrive
     // https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_retrieve_post.htm
@@ -239,6 +295,7 @@ const app = new Elysia()
       })
 
       store.sfdc_auth = await response.json() as SFDC_Auth
+      upsertConnection.run({$name: azheroku_domain, $auth: JSON.stringify(store.sfdc_auth), $status: 0})
       set.redirect ='/?sfdc_auth_redirect=true'
       
     } catch (error) {
@@ -255,3 +312,23 @@ const app = new Elysia()
 console.log(
   `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
 );
+
+
+setInterval(async () => {
+  const connection = getConnection.all({$name: azheroku_domain})[0]
+  if (!connection) return console.error('no connection found')
+  const sfdc_auth = JSON.parse(connection.auth) as SFDC_Auth
+
+  const syncs = queryAllSync.all(null)
+  syncs.forEach(async (sync) => {
+    const sobjdef = JSON.parse(sync.sfdc_definition) as SFDC_SOBJECT_DEFINITION
+    if (sync.status === SYNC_STATUS.PULL) {
+      const qresponse = await fetch(`${sfdc_auth.instance_url}/services/data/v54.0/query?q=select+${sobjdef.fields.map(f => f.name).join(',')}+from+${sobjdef.name}`, { headers: {
+          'Authorization': `Bearer ${sfdc_auth.access_token}` }
+      })
+      const sobjdata = await qresponse.json()
+
+    }
+  })
+}
+, 1000 * 30 * 1) // 30 seconds minutes
