@@ -50,7 +50,7 @@ const SFDCType2SQL = {
   "url": "TEXT"
 }
 
-enum SYNC_STATUS {
+enum SYNC_MODE {
   NONE = 0,
   PULL = 1,
   PUSH = 2,
@@ -59,13 +59,14 @@ enum SYNC_STATUS {
 
 const db = new Database(":memory:") 
 //const db = new Database("mydb.sqlite");
-db.query(`CREATE TABLE connections (name TEXT PRIMARY KEY, auth TEXT NOT NULL, status INTEGER);`).run();
-const upsertConnection = db.query<void, {$name: string, $auth: string, $status: number}>(`INSERT INTO connections VALUES  ($name, json($auth), $status) ON CONFLICT(name) DO UPDATE SET auth=json($auth), status=$status`);
-const getConnection = db.query<{auth: string, status: number}, {$name: string}>(`select name,auth,status FROM connections WHERE name = $name`);
+db.query(`CREATE TABLE connections (name TEXT PRIMARY KEY, auth TEXT NOT NULL, mode INTEGER, lastrun DATE, laststatus INTEGER, lastmessage TEXT);`).run();
+const upsertConnection = db.query<void, {$name: string, $auth: string, $mode: number}>(`INSERT INTO connections (name, auth, mode) VALUES  ($name, json($auth), $status) ON CONFLICT(name) DO UPDATE SET auth=json($auth), mode=$mode`);
+const getConnection = db.query<{auth: string, mode: number}, {$name: string}>(`select name, auth, mode FROM connections WHERE name = $name`);
+
+db.query(`CREATE TABLE monitor (date DATETIME, connection_name TEXT, sObject TEXT, describeCalls NUMBER, queryCalls NUMBER, upsertCalls INTEGER, status INTEGER, message TEXT);`).run();
 
 
 db.query(`CREATE TABLE syncd_objects (sobject_name TEXT PRIMARY KEY, sfdc_definition TEXT NOT NULL, sql_definition TEXT, status INTEGER, last_sync DATE);`).run();
-
 const upsertSync = db.query<void, {$sobject_name: string, $sfdc_definition: string, $sql_definition: string, $status: number}>(`INSERT INTO syncd_objects (sobject_name, sfdc_definition, sql_definition, status) VALUES  ($sobject_name, json($sfdc_definition), $sql_definition, $status) ON CONFLICT(sobject_name) DO UPDATE SET sfdc_definition=json($sfdc_definition), status=$status`);
 const querySync = db.query<{sfdc_definition: string, sql_definition: string, status: number}, {$sobjectName: string}>(`select sfdc_definition, sql_definition, status FROM syncd_objects WHERE sobject_name = $sobjectName`);
 const queryAllSync = db.query<{sobject_name: string, sfdc_definition: string, sql_definition: string, status: number}, null>(`select sobject_name, sfdc_definition, sql_definition, status FROM syncd_objects`);
@@ -91,12 +92,14 @@ type SFDC_SOBJECT_DEFINITION = {
 }
 
 
+const help = <TxtResponse assistantMessage={<div><Command command='/monitor'/> <Command command='/status'/> <Command command='/sObjects'/> <Command command='/status'/> to list sObjects or... just chat to me, I can be very helpful</div>} />
 
 const app = new Elysia()
   .use(html()) 
   .state('sfdc_auth', {} as SFDC_Auth)
   .get("/", ({ query: { sfdc_auth_redirect }, store: {sfdc_auth}}) => 
       <Page title="AzSalesforceConnect">
+        { help } 
         { sfdc_auth_redirect === 'true' && sfdc_auth.access_token &&
           <TxtResponse assistantMessage={<div>Logged into Salesforce, now you can list sObjects here <Command command='/sObjects'/>, or just chat to me, I can be very helpful</div>} />
         }
@@ -107,7 +110,7 @@ const app = new Elysia()
     })
   })
   .get('/help', () =>
-      <TxtResponse assistantMessage={<div>Type <Command command='/sObjects'/> <Command command='/status'/> to list sObjects or... just chat to me, I can be very helpful</div>} />
+      help
     )
   .get('/status', () => {
     const syncs = queryAllSync.all(null)
@@ -121,7 +124,7 @@ const app = new Elysia()
         { syncs.map((sync) =>
           <tr>
             <td>{sync.sobject_name}</td>
-            <td>{SYNC_STATUS[sync.status]}</td>
+            <td>{SYNC_MODE[sync.status]}</td>
           </tr>
         )}
       </table>
@@ -148,7 +151,7 @@ const app = new Elysia()
           <th>Describe</th>
           <th>Sync</th>
         </tr>
-        { resjson.sobjects./*filter((s: any) => s.custom).*/map((sObject: any) =>
+        { resjson.sobjects.filter((s: any) => s.name === 'Account' || s.name === 'Contact').map((sObject: any) =>
           <tr>
             <td>{sObject.name}</td>
             <td>{sObject.label}</td>
@@ -224,8 +227,7 @@ const app = new Elysia()
 
       db.query(`CREATE TABLE ${sObject} (${sobjdef.fields.map(f => `${f.name} ${SFDCType2SQL[f.type as keyof typeof SFDCType2SQL]}`).join(',')})`).run()
       
-      const upsertStmt = `INSERT INTO sObject (${sobjdef.fields.map(f => f.name).join(',')}) VALUES  (${sobjdef.fields.map(f => `$${f.name}`).join(',')}) ON CONFLICT(Id) DO UPDATE SET (${sobjdef.fields.map(f => `${f.name}=$${f.name}`).join(',')}`
-      upsertSync.run({$sobject_name: sobjdef.name, $sfdc_definition: JSON.stringify(sobjdef), $sql_definition: upsertStmt, $status: SYNC_STATUS.PULL})
+      upsertSync.run({$sobject_name: sobjdef.name, $sfdc_definition: JSON.stringify(sobjdef), $sql_definition: '', $status: SYNC_MODE.PULL})
 
       return <TxtResponse assistantMessage={<div>Successfully set sObject {sObject} to sync</div>} />
       
@@ -239,6 +241,9 @@ const app = new Elysia()
       mode: t.String((s: string) => ['describe', 'sync', 'query'].includes(s))
     })
   })
+  .get('/test', async () => {
+    return <div>test</div>
+  })
   .get('/monitor', async () => {
     const processid = '' + new Date().getTime()
       const scrollWorkaround = { 'hx-on:htmx:sse-message' : `document.getElementById('messages').scrollIntoView(false)`}
@@ -249,26 +254,56 @@ const app = new Elysia()
           </div>
       } /> 
    })
-  .get('/monitor/:processid', async ({params: { sObject, processid },  store: {sfdc_auth}}) => new Stream(async (stream) => {
+  .get('/monitor/:processid', async ({params: { processid },  store: {sfdc_auth}}) => new Stream(async (stream) => {
 
-    const sync = querySync.all({$sobjectName: sObject})[0]
-    const sfdc_definition = JSON.parse(sync.sfdc_definition)
+    var messages = ''
+    var log = (msg:string, end = false) => { messages += <div>{msg}</div>; if (end) stream.event = `close${processid}`; stream.send(messages)}
 
-    if (!sync) return stream.send('No sync definition found')
+    log ('Starting syncing...')
 
-    stream.send('Syncing ' + sObject + '...')
+    try {
+      const connection = getConnection.get({$name: azheroku_domain})
+      if (!connection) return log('no connection found', true)
+      const sfdc_auth = JSON.parse(connection.auth) as SFDC_Auth
 
+      const syncs = queryAllSync.all(null)
+      for (const sync of syncs) {
+        log (`Checking ${sync.sobject_name}..`)
+        
+        if (sync.status === SYNC_MODE.PULL) {
+          log (`Syncing ${sync.sobject_name}..`)
+          const sobjdef = JSON.parse(sync.sfdc_definition) as SFDC_SOBJECT_DEFINITION
+          log (`Fetching Data ${sync.sobject_name}..`)
+          const qresponse = await fetch(`${sfdc_auth.instance_url}/services/data/v54.0/query?q=select+${sobjdef.fields.map(f => f.name).join(',')}+from+${sobjdef.name}`, { headers: {
+              'Authorization': `Bearer ${sfdc_auth.access_token}` }
+          })
+          const sobjdata = await qresponse.json()
+          log (`Fetched ${sobjdata.totalSize} records for ${sync.sobject_name}..(done=${sobjdata.done})`)
+          
+          //const values = [...Array(sobjdata.totalSize).keys()].map(i =>  `(${sobjdef.fields.map(f => `$${f.name}${i}`).join(',')})`).join(',')
+          //const upsertStmt = `INSERT INTO ${sync.sobject_name} (${sobjdef.fields.map(f => f.name).join(',')}) VALUES  ${values} ON CONFLICT(Id) DO UPDATE SET (${sobjdef.fields.map(f => `${f.name}=$${f.name}`).join(',')}`
+          const upsertStmt = db.prepare(`INSERT INTO ${sync.sobject_name} (${sobjdef.fields.map(f => f.name).join(',')}) VALUES  (${sobjdef.fields.map(f => `$${f.name}`).join(',')}) ON CONFLICT(Id) DO UPDATE SET (${sobjdef.fields.map(f => `${f.name}=$${f.name}`).join(',')}`)
+          
+          const insertBulk = db.transaction(records => {
+            for (const record of records) upsertStmt.run(record);
+          });
 
-    // updated and retrive
-    // https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_retrieve_post.htm
+          const count = insertBulk(sobjdata.records);
+          
+          console.log(`Inserted ${count} cats`);
 
-    stream.event = `close${processid}`
-    stream.send('Finished Syncing ' + sObject + '.')
-    stream.close()
-
+          //const bindings = sobjdata.records.map((r: any,idx: number) => sobjdef.fields.reduce((facc, fld) => { return  {...facc, [`$${fld.name}${idx}`]: r[fld.name]}}, {})).reduce((acc: any,a: any) => { return {...acc, ...a}}, {})
+          //log (bindings)
+          //db.query(upsertStmt).run(bindings)
+          log (`Inserted ${sobjdata.totalSize} records into ${sync.sobject_name})`)
+        }
+        log (`Done`, true)
+      }
+    } catch (error) {
+      log (`Failed to sync ${azheroku_domain}: ${JSON.stringify(error)}`, true)
+    }
   }, { event: processid }), {
     params: t.Object({
-      sObject: t.String(),
       processid: t.String()
     })
   })
@@ -295,7 +330,7 @@ const app = new Elysia()
       })
 
       store.sfdc_auth = await response.json() as SFDC_Auth
-      upsertConnection.run({$name: azheroku_domain, $auth: JSON.stringify(store.sfdc_auth), $status: 0})
+      upsertConnection.run({$name: azheroku_domain, $auth: JSON.stringify(store.sfdc_auth), $mode: SYNC_MODE.NONE})
       set.redirect ='/?sfdc_auth_redirect=true'
       
     } catch (error) {
@@ -315,20 +350,6 @@ console.log(
 
 
 setInterval(async () => {
-  const connection = getConnection.all({$name: azheroku_domain})[0]
-  if (!connection) return console.error('no connection found')
-  const sfdc_auth = JSON.parse(connection.auth) as SFDC_Auth
-
-  const syncs = queryAllSync.all(null)
-  syncs.forEach(async (sync) => {
-    const sobjdef = JSON.parse(sync.sfdc_definition) as SFDC_SOBJECT_DEFINITION
-    if (sync.status === SYNC_STATUS.PULL) {
-      const qresponse = await fetch(`${sfdc_auth.instance_url}/services/data/v54.0/query?q=select+${sobjdef.fields.map(f => f.name).join(',')}+from+${sobjdef.name}`, { headers: {
-          'Authorization': `Bearer ${sfdc_auth.access_token}` }
-      })
-      const sobjdata = await qresponse.json()
-
-    }
-  })
+  
 }
 , 1000 * 30 * 1) // 30 seconds minutes
